@@ -242,7 +242,12 @@ class ByteBuffer implements \JsonSerializable, \Serializable {
      * @param string $serialized
      */
     public function unserialize($serialized) {
-        $this->_data = \unserialize($serialized);
+        // SECURITY PATCH: _data is always a plain string, so forbid object
+        // instantiation during unserialize to prevent this class being used as a
+        // PHP object-injection (POP) gadget. Coerce any non-string result (e.g. a
+        // malicious embedded object) to empty rather than trusting it.
+        $data = \unserialize($serialized, ['allowed_classes' => false]);
+        $this->_data = \is_string($data) ? $data : '';
         $this->_length = \strlen($this->_data);
     }
 
@@ -271,7 +276,11 @@ class ByteBuffer implements \JsonSerializable, \Serializable {
      */
     public function __unserialize($data) {
         if ($data && isset($data['data'])) {
-            $this->_data = \unserialize($data['data']);
+            // SECURITY PATCH: forbid object instantiation during unserialize to
+            // prevent this class being used as a PHP object-injection (POP) gadget.
+            // Coerce any non-string result to empty rather than trusting it.
+            $inner = \unserialize($data['data'], ['allowed_classes' => false]);
+            $this->_data = \is_string($inner) ? $inner : '';
             $this->_length = \strlen($this->_data);
         }
     }

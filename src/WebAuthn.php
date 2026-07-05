@@ -528,10 +528,16 @@ class WebAuthn {
      * https://fidoalliance.org/metadata/
      * @param string $certFolder Folder path to save the certificates in PEM format.
      * @param bool $deleteCerts delete certificates in the target folder before adding the new ones.
+     * @param string|array|null $jwtRootCertificates path(s)/PEM(s) of the trust anchor the MDS
+     *                                             BLOB is signed by (e.g. the GlobalSign root that
+     *                                             signs the FIDO Alliance MDS). When provided, the
+     *                                             embedded x5c chain is verified against it. Strongly
+     *                                             recommended: without it the download is only
+     *                                             protected by TLS.
      * @return int number of cetificates
      * @throws WebAuthnException
      */
-    public function queryFidoMetaDataService($certFolder, $deleteCerts=true) {
+    public function queryFidoMetaDataService($certFolder, $deleteCerts=true, $jwtRootCertificates=null) {
         $url = 'https://mds.fidoalliance.org/';
         $raw = null;
         if (\function_exists('curl_init')) {
@@ -559,6 +565,12 @@ class WebAuthn {
         if (\count($jwt) !== 3) {
             throw new WebAuthnException('Invalid JWT from FIDO Alliance Metadata Service');
         }
+
+        // SECURITY PATCH: the FIDO MDS BLOB is a signed JWS; the original code
+        // discarded the signature and trusted the payload after a TLS-only fetch.
+        // Verify the JWS signature (and, when a root is provided, the x5c chain)
+        // before importing any attestation roots from it.
+        $this->_verifyMetadataBlobSignature($jwt[0], $jwt[1], $jwt[2], $jwtRootCertificates);
 
         if ($deleteCerts) {
             foreach (\scandir($certFolder) as $ca) {
@@ -634,11 +646,18 @@ class WebAuthn {
 
         // extract host from origin
         $host = \parse_url($origin, PHP_URL_HOST);
+        if (!\is_string($host) || $host === '') {
+            return false;
+        }
         $host = \trim($host, '.');
 
-        // The RP ID must be equal to the origin's effective domain, or a registrable
-        // domain suffix of the origin's effective domain.
-        return \preg_match('/' . \preg_quote($this->_rpId) . '$/i', $host) === 1;
+        // SECURITY PATCH: the original check used an unanchored suffix regex
+        // (/rpId$/i) which matched sibling domains such as "evilexample.com" for
+        // rpId "example.com". The RP ID must equal the origin's effective domain,
+        // or be a registrable domain suffix (i.e. separated by a dot boundary).
+        $host = \strtolower($host);
+        $rpId = \strtolower($this->_rpId);
+        return $host === $rpId || \str_ends_with($host, '.' . $rpId);
     }
 
     /**
@@ -710,5 +729,130 @@ class WebAuthn {
         }
 
         return \openssl_verify($dataToVerify, $signature, $publicKey, OPENSSL_ALGO_SHA256) === 1;
+    }
+
+    /**
+     * SECURITY PATCH: verifies the signature of a FIDO Metadata Service JWS BLOB.
+     * Verifies the signature over "header.payload" using the leaf certificate in
+     * the JWS header x5c. When $jwtRootCertificates is provided, the x5c chain is
+     * additionally verified against that trust anchor. Fails closed.
+     * @param string $header64 base64url-encoded JWS header
+     * @param string $payload64 base64url-encoded JWS payload
+     * @param string $signature64 base64url-encoded JWS signature
+     * @param string|array|null $jwtRootCertificates
+     * @return void
+     * @throws WebAuthnException
+     */
+    private function _verifyMetadataBlobSignature($header64, $payload64, $signature64, $jwtRootCertificates) {
+        $header = \json_decode(ByteBuffer::fromBase64Url($header64)->getBinaryString());
+        if (!\is_object($header) || !isset($header->alg) || !isset($header->x5c) || !\is_array($header->x5c) || \count($header->x5c) === 0) {
+            throw new WebAuthnException('invalid MDS JWS header', WebAuthnException::INVALID_DATA);
+        }
+
+        if (!\in_array($header->alg, ['RS256', 'ES256'], true)) {
+            throw new WebAuthnException('unsupported MDS JWS algorithm: ' . $header->alg, WebAuthnException::INVALID_DATA);
+        }
+
+        // leaf certificate that signed the BLOB
+        $leafPem = "-----BEGIN CERTIFICATE-----\n" . \chunk_split($header->x5c[0], 64, "\n") . "-----END CERTIFICATE-----\n";
+        $publicKey = \openssl_pkey_get_public($leafPem);
+        if ($publicKey === false) {
+            throw new WebAuthnException('invalid MDS signing certificate', WebAuthnException::INVALID_PUBLIC_KEY);
+        }
+
+        $signingInput = $header64 . '.' . $payload64;
+        $signature = ByteBuffer::fromBase64Url($signature64)->getBinaryString();
+
+        // JWS ES256 signatures are the raw R||S concatenation; openssl_verify
+        // expects an ASN.1/DER encoded ECDSA signature.
+        if ($header->alg === 'ES256') {
+            $signature = $this->_ecRawSignatureToDer($signature);
+        }
+
+        if (\openssl_verify($signingInput, $signature, $publicKey, OPENSSL_ALGO_SHA256) !== 1) {
+            throw new WebAuthnException('invalid signature on FIDO Metadata Service BLOB', WebAuthnException::INVALID_SIGNATURE);
+        }
+
+        // if a trust anchor is provided, verify the x5c chain terminates at it
+        if ($jwtRootCertificates !== null) {
+            $rootsIn = \is_array($jwtRootCertificates) ? $jwtRootCertificates : [$jwtRootCertificates];
+            $tempFiles = [];
+
+            // openssl_x509_checkpurpose's ca_info takes file paths; normalise any
+            // inline PEM string to a temp file.
+            $roots = [];
+            foreach ($rootsIn as $root) {
+                if (\is_string($root) && \is_file($root)) {
+                    $roots[] = $root;
+                } else if (\is_string($root)) {
+                    $tmp = \tempnam(\sys_get_temp_dir(), 'mds_root_');
+                    \file_put_contents($tmp, $root);
+                    $roots[] = $tmp;
+                    $tempFiles[] = $tmp;
+                }
+            }
+
+            // intermediate certificates from the header, written as untrusted chain
+            $chainFile = null;
+            if (\count($header->x5c) > 1) {
+                $chainContent = '';
+                for ($i = 1; $i < \count($header->x5c); $i++) {
+                    $chainContent .= "-----BEGIN CERTIFICATE-----\n" . \chunk_split($header->x5c[$i], 64, "\n") . "-----END CERTIFICATE-----\n";
+                }
+                $chainFile = \tempnam(\sys_get_temp_dir(), 'mds_chain_');
+                \file_put_contents($chainFile, $chainContent);
+                $tempFiles[] = $chainFile;
+            }
+
+            $valid = $chainFile
+                    ? \openssl_x509_checkpurpose($leafPem, -1, $roots, $chainFile)
+                    : \openssl_x509_checkpurpose($leafPem, -1, $roots);
+
+            foreach ($tempFiles as $tmp) {
+                if (\is_file($tmp)) {
+                    \unlink($tmp);
+                }
+            }
+
+            if ($valid !== true) {
+                throw new WebAuthnException('FIDO Metadata Service BLOB certificate not trusted', WebAuthnException::CERTIFICATE_NOT_TRUSTED);
+            }
+        }
+    }
+
+    /**
+     * SECURITY PATCH: converts a raw (R||S) ECDSA signature, as used by JWS/JWA,
+     * into the ASN.1/DER encoding expected by openssl_verify. Assumes P-256
+     * (each integer and the resulting sequence are shorter than 128 bytes).
+     * @param string $raw
+     * @return string
+     * @throws WebAuthnException
+     */
+    private function _ecRawSignatureToDer($raw) {
+        $len = \strlen($raw);
+        if ($len === 0 || $len % 2 !== 0) {
+            throw new WebAuthnException('invalid raw ECDSA signature length', WebAuthnException::INVALID_SIGNATURE);
+        }
+        $half = \intdiv($len, 2);
+        $r = \ltrim(\substr($raw, 0, $half), "\x00");
+        $s = \ltrim(\substr($raw, $half), "\x00");
+
+        // pad if the high bit is set, so the value is not interpreted as negative
+        if ($r === '' ) {
+            $r = "\x00";
+        } else if (\ord($r[0]) & 0x80) {
+            $r = "\x00" . $r;
+        }
+        if ($s === '') {
+            $s = "\x00";
+        } else if (\ord($s[0]) & 0x80) {
+            $s = "\x00" . $s;
+        }
+
+        $rSeq = "\x02" . \chr(\strlen($r)) . $r;
+        $sSeq = "\x02" . \chr(\strlen($s)) . $s;
+        $seq = $rSeq . $sSeq;
+
+        return "\x30" . \chr(\strlen($seq)) . $seq;
     }
 }
