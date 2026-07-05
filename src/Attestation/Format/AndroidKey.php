@@ -81,12 +81,15 @@ class AndroidKey extends FormatBase {
      * @throws WebAuthnException
      */
     public function validateRootCertificate($rootCas) {
-        $chainC = $this->_createX5cChainFile();
-        if ($chainC) {
-            $rootCas[] = $chainC;
-        }
+        // SECURITY PATCH: attacker-supplied x5c chain certificates must be passed
+        // as UNTRUSTED intermediates (4th arg), not appended to the trusted CA
+        // list (3rd arg), otherwise a non-self-signed attacker intermediate would
+        // become a trust anchor.
+        $untrustedChainFile = $this->_createX5cChainFile();
 
-        $v = \openssl_x509_checkpurpose($this->getCertificatePem(), -1, $rootCas);
+        $v = $untrustedChainFile
+                ? \openssl_x509_checkpurpose($this->getCertificatePem(), -1, $rootCas, $untrustedChainFile)
+                : \openssl_x509_checkpurpose($this->getCertificatePem(), -1, $rootCas);
         if ($v === -1) {
             throw new WebAuthnException('error on validating root certificate: ' . \openssl_error_string(), WebAuthnException::CERTIFICATE_NOT_TRUSTED);
         }

@@ -12,6 +12,10 @@ use lbuchs\WebAuthn\Binary\ByteBuffer;
  * Thanks Thomas for your work!
  */
 class CborDecoder {
+    // SECURITY PATCH: cap nesting depth to prevent stack-exhaustion DoS from
+    // deeply nested (or long tag-chained) attacker-supplied CBOR.
+    const MAX_DEPTH = 32;
+
     const CBOR_MAJOR_UNSIGNED_INT = 0;
     const CBOR_MAJOR_TEXT_STRING = 3;
     const CBOR_MAJOR_FLOAT_SIMPLE = 7;
@@ -61,7 +65,12 @@ class CborDecoder {
      * @param int $offset
      * @return mixed
      */
-    protected static function _parseItem(ByteBuffer $buf, &$offset) {
+    protected static function _parseItem(ByteBuffer $buf, &$offset, $depth = 0) {
+        // SECURITY PATCH: bound recursion depth.
+        if ($depth > self::MAX_DEPTH) {
+            throw new WebAuthnException('CBOR nesting depth exceeded.', WebAuthnException::CBOR);
+        }
+
         $first = $buf->getByteVal($offset++);
         $type = $first >> 5;
         $val = $first & 0b11111;
@@ -72,7 +81,7 @@ class CborDecoder {
 
         $val = self::_parseExtraLength($val, $buf, $offset);
 
-        return self::_parseItemData($type, $val, $buf, $offset);
+        return self::_parseItemData($type, $val, $buf, $offset, $depth);
     }
 
     protected static function _parseFloatSimple($val, ByteBuffer $buf, &$offset) {
@@ -161,7 +170,7 @@ class CborDecoder {
         return $val;
     }
 
-    protected static function _parseItemData($type, $val, ByteBuffer $buf, &$offset) {
+    protected static function _parseItemData($type, $val, ByteBuffer $buf, &$offset, $depth = 0) {
         switch ($type) {
             case self::CBOR_MAJOR_UNSIGNED_INT: // uint
                 return $val;
@@ -180,25 +189,25 @@ class CborDecoder {
                 return $data; // UTF-8
 
             case self::CBOR_MAJOR_ARRAY:
-                return self::_parseArray($buf, $offset, $val);
+                return self::_parseArray($buf, $offset, $val, $depth);
 
             case self::CBOR_MAJOR_MAP:
-                return self::_parseMap($buf, $offset, $val);
+                return self::_parseMap($buf, $offset, $val, $depth);
 
             case self::CBOR_MAJOR_TAG:
-                return self::_parseItem($buf, $offset); // 1 embedded data item
+                return self::_parseItem($buf, $offset, $depth + 1); // 1 embedded data item
         }
 
         // This should never be reached
         throw new WebAuthnException(sprintf('Unknown major type %d.', $type), WebAuthnException::CBOR);
     }
 
-    protected static function _parseMap(ByteBuffer $buf, &$offset, $count) {
+    protected static function _parseMap(ByteBuffer $buf, &$offset, $count, $depth = 0) {
         $map = array();
 
         for ($i = 0; $i < $count; $i++) {
-            $mapKey = self::_parseItem($buf, $offset);
-            $mapVal = self::_parseItem($buf, $offset);
+            $mapKey = self::_parseItem($buf, $offset, $depth + 1);
+            $mapVal = self::_parseItem($buf, $offset, $depth + 1);
 
             if (!\is_int($mapKey) && !\is_string($mapKey)) {
                 throw new WebAuthnException('Can only use strings or integers as map keys', WebAuthnException::CBOR);
@@ -209,10 +218,10 @@ class CborDecoder {
         return $map;
     }
 
-    protected static function _parseArray(ByteBuffer $buf, &$offset, $count) {
+    protected static function _parseArray(ByteBuffer $buf, &$offset, $count, $depth = 0) {
         $arr = array();
         for ($i = 0; $i < $count; $i++) {
-            $arr[] = self::_parseItem($buf, $offset);
+            $arr[] = self::_parseItem($buf, $offset, $depth + 1);
         }
 
         return $arr;
